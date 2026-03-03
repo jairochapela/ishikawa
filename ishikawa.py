@@ -126,6 +126,11 @@ class Ishikawa(Node):
         self._validate()
         return ASCIIFishboneRenderer().render(self)
 
+    def to_html(self) -> str:
+        """Devuelve el diagrama como página HTML con listas anidadas y CSS de espina de pescado."""
+        self._validate()
+        return HTMLRenderer().render(self)
+
     def display(self) -> None:
         """
         Renderiza el diagrama visualmente.
@@ -402,6 +407,300 @@ class SVGFishboneRenderer(BaseRenderer):
                     f'text-anchor="middle" font-size="11" font-weight="bold" '
                     f'fill="#c0392b">{line}</text>'
                 )
+
+
+class HTMLRenderer(BaseRenderer):
+    """
+    Renderiza un diagrama Ishikawa como un documento HTML completo y
+    autocontenido, usando listas ``<ul>/<li>`` anidadas.
+
+    El CSS embebido transforma la jerarquía de listas en una representación
+    visual que se asemeja a una espina de pescado:
+
+    * La espina dorsal es una línea horizontal que cruza el centro del diagrama.
+    * Los recursos (nivel 1) se conectan a la espina con ramas diagonales,
+      alternando arriba (índice par) y abajo (índice impar).
+    * Las causas y subcausas (nivel 2+) se listan en columna a lo largo de
+      cada rama, con tamaño y color decrecientes según la profundidad.
+
+    Clases CSS generadas
+    --------------------
+    ``.ik-diagram``   – ``<ul>`` raíz; flex row, problema a la derecha.
+    ``.ik-problem``   – ``<li>`` del problema; cabeza del pez.
+    ``.ik-resources`` – ``<ul>`` de recursos; contiene la línea de espina.
+    ``.ik-resource``  – ``<li>`` de recurso; con rama diagonal vía ``::before``.
+    ``.ik-above``     – recurso por encima de la espina (índice par).
+    ``.ik-below``     – recurso por debajo de la espina (índice impar).
+    ``.ik-causes``    – ``<ul>`` de causas/subcausas.
+    ``.ik-cause``     – ``<li>`` de causa individual.
+    ``.ik-dN``        – profundidad N (0 = problema, 1 = recurso, 2+ = causa).
+    ``.ik-label``     – ``<span>`` con el texto de cada nodo.
+    """
+
+    # ── CSS embebido ──────────────────────────────────────────────────────────
+
+    _CSS: str = """\
+/* ─── Reset ───────────────────────────────────────────────────────────── */
+.ik-diagram, .ik-diagram ul, .ik-diagram li {
+  list-style: none;
+  margin:     0;
+  padding:    0;
+}
+
+/* ─── Raíz: flex row, problema a la derecha ────────────────────────────── */
+.ik-diagram {
+  display:        flex;
+  flex-direction: row-reverse;
+  align-items:    center;
+  font-family:    Arial, Helvetica, sans-serif;
+  background:     #fdfcfa;
+  padding:        28px;
+  overflow-x:     auto;
+  border-radius:  8px;
+}
+
+/* ─── Problema – cabeza del pez ────────────────────────────────────────── */
+.ik-problem { flex-shrink: 0; position: relative; z-index: 2; }
+
+.ik-d0 > .ik-label {
+  display:       block;
+  background:    #fde8d8;
+  border:        2.5px solid #c0392b;
+  border-radius: 8px;
+  padding:       12px 18px;
+  font-weight:   bold;
+  font-size:     14px;
+  color:         #c0392b;
+  text-align:    center;
+  max-width:     200px;
+  word-break:    break-word;
+}
+
+/* ─── Lista de recursos – espina horizontal ────────────────────────────── */
+.ik-resources {
+  display:        flex;
+  flex-direction: row-reverse; /* el recurso más cercano al problema queda a la derecha */
+  align-items:    center;
+  position:       relative;
+  padding:        96px 0;      /* espacio para las ramas arriba y abajo */
+}
+
+/* Línea de la espina */
+.ik-resources::before {
+  content:    '';
+  position:   absolute;
+  left:       0; right: 0;
+  top:        50%;
+  height:     3px;
+  background: linear-gradient(to right, #95a5a6, #2c3e50);
+  transform:  translateY(-50%);
+  z-index:    0;
+}
+
+/* Flecha hacia el problema */
+.ik-resources::after {
+  content:    '';
+  position:   absolute;
+  right:      -11px;
+  top:        50%;
+  transform:  translateY(-50%);
+  border-left:   12px solid #2c3e50;
+  border-top:    7px solid transparent;
+  border-bottom: 7px solid transparent;
+}
+
+/* ─── Recurso – rama principal ──────────────────────────────────────────── */
+.ik-resource {
+  position:   relative;
+  display:    flex;
+  flex-direction: column;
+  align-items: center;
+  padding:    0 18px;
+  min-width:  90px;
+  z-index:    1;
+}
+
+/* Rama diagonal conectada a la espina */
+.ik-resource::before {
+  content:          '';
+  position:         absolute;
+  width:            3px;
+  height:           68px;       /* longitud visible de la rama */
+  background:       #1a5276;
+  left:             50%;
+  transform-origin: center center;
+  z-index:          0;
+}
+
+/* Arriba: rama desde la espina hacia arriba-izquierda */
+.ik-above::before {
+  bottom:    calc(50% - 2px);
+  transform: translateX(-50%) rotate(-45deg);
+}
+
+/* Abajo: rama desde la espina hacia abajo-izquierda */
+.ik-below::before {
+  top:       calc(50% - 2px);
+  transform: translateX(-50%) rotate(45deg);
+}
+
+/* Recursos de arriba: causas encima de la espina */
+.ik-above { justify-content: flex-end; }
+
+/* Recursos de abajo: causas debajo de la espina */
+.ik-below { justify-content: flex-start; }
+
+/* ─── Etiqueta del recurso ──────────────────────────────────────────────── */
+.ik-d1 > .ik-label {
+  display:       block;
+  background:    #d6eaf8;
+  border:        1.5px solid #1a5276;
+  border-radius: 5px;
+  padding:       5px 10px;
+  font-weight:   bold;
+  font-size:     12px;
+  color:         #1a5276;
+  text-align:    center;
+  white-space:   nowrap;
+  position:      relative;
+  z-index:       2;
+}
+
+.ik-above .ik-d1 > .ik-label { margin-bottom: 10px; }
+.ik-below .ik-d1 > .ik-label { margin-top:    10px; }
+
+/* ─── Lista de causas ───────────────────────────────────────────────────── */
+.ik-causes {
+  display:        flex;
+  flex-direction: column;
+  gap:            4px;
+  align-items:    flex-start;
+  position:       relative;
+  z-index:        2;
+}
+
+.ik-above .ik-causes { margin-bottom: 5px; }
+.ik-below .ik-causes { margin-top:    5px; }
+
+/* ─── Causa – nivel 2 ───────────────────────────────────────────────────── */
+.ik-d2 > .ik-label {
+  display:       inline-block;
+  background:    #eaf4fb;
+  border:        1px solid #5dade2;
+  border-radius: 4px;
+  padding:       3px 9px;
+  font-size:     11px;
+  color:         #2c3e50;
+  white-space:   nowrap;
+}
+
+.ik-d2 > .ik-label::before { content: '▸ '; color: #5dade2; font-size: 9px; }
+
+/* ─── Subcausa – nivel 3 ────────────────────────────────────────────────── */
+.ik-d3 > .ik-label {
+  display:       inline-block;
+  background:    #f9f9f9;
+  border:        1px solid #aab7c4;
+  border-radius: 3px;
+  padding:       2px 7px;
+  font-size:     10px;
+  color:         #555;
+  white-space:   nowrap;
+  margin-left:   12px;
+}
+
+.ik-d3 > .ik-label::before { content: '· '; color: #aab7c4; }
+
+/* ─── Profundidades 4 y 5 ───────────────────────────────────────────────── */
+.ik-d4 > .ik-label,
+.ik-d5 > .ik-label {
+  display:       inline-block;
+  background:    #f5f5f5;
+  border:        1px solid #ddd;
+  border-radius: 3px;
+  padding:       2px 5px;
+  font-size:     9px;
+  color:         #888;
+  white-space:   nowrap;
+  margin-left:   22px;
+}
+
+.ik-d4 > .ik-label::before,
+.ik-d5 > .ik-label::before { content: '  · '; color: #ccc; }
+"""
+
+    # ── Renderizado ───────────────────────────────────────────────────────────
+
+    def render(self, root: Ishikawa) -> str:
+        body = self._diagram(root)
+        return (
+            '<!DOCTYPE html>\n'
+            '<html lang="es">\n'
+            '<head>\n'
+            '  <meta charset="UTF-8">\n'
+            '  <meta name="viewport" content="width=device-width,initial-scale=1">\n'
+            f'  <title>Ishikawa – {self._e(root.text)}</title>\n'
+            '  <style>\n'
+            f'{self._CSS}'
+            '  </style>\n'
+            '</head>\n'
+            '<body>\n'
+            f'{body}\n'
+            '</body>\n'
+            '</html>\n'
+        )
+
+    def _diagram(self, root: Ishikawa) -> str:
+        resources_html = self._resources(root.children) if root.children else ''
+        return (
+            '<ul class="ik-diagram">\n'
+            '  <li class="ik-problem ik-d0">\n'
+            f'    <span class="ik-label">{self._e(root.text)}</span>\n'
+            f'{resources_html}'
+            '  </li>\n'
+            '</ul>'
+        )
+
+    def _resources(self, resources: List[Node]) -> str:
+        items: List[str] = []
+        for i, res in enumerate(resources):
+            side = 'ik-above' if i % 2 == 0 else 'ik-below'
+            causes_html = self._causes(res.children, depth=2, indent=3) if res.children else ''
+            items.append(
+                f'      <li class="ik-resource ik-d1 {side}">\n'
+                f'        <span class="ik-label">{self._e(res.text)}</span>\n'
+                f'{causes_html}'
+                f'      </li>'
+            )
+        return (
+            '    <ul class="ik-resources">\n'
+            + '\n'.join(items) + '\n'
+            + '    </ul>\n'
+        )
+
+    def _causes(self, nodes: List[Node], depth: int, indent: int) -> str:
+        pad = '  ' * indent
+        d_cls = f'ik-d{min(depth, 5)}'
+        lines = [f'{pad}<ul class="ik-causes ik-depth-{depth}">']
+        for node in nodes:
+            lines.append(f'{pad}  <li class="ik-cause {d_cls}">')
+            lines.append(f'{pad}    <span class="ik-label">{self._e(node.text)}</span>')
+            if node.children:
+                lines.append(self._causes(node.children, depth + 1, indent + 1))
+            lines.append(f'{pad}  </li>')
+        lines.append(f'{pad}</ul>')
+        return '\n'.join(lines) + '\n'
+
+    @staticmethod
+    def _e(text: str) -> str:
+        """Escapa caracteres especiales HTML."""
+        return (
+            text
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+            .replace('"', '&quot;')
+        )
 
 
 class JupyterRenderer(BaseRenderer):

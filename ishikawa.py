@@ -121,8 +121,28 @@ class Ishikawa(Node):
         return renderer.render(self)
 
     def display(self) -> None:
-        """Imprime el diagrama en formato Mermaid."""
-        print(self.to_mermaid())
+        """
+        Renderiza el diagrama visualmente.
+
+        - En Jupyter/IPython: muestra el diagrama interactivo vía Mermaid.js.
+        - En terminal: imprime el código Mermaid.
+        """
+        try:
+            from IPython.display import HTML, display as ipy_display  # type: ignore
+            ipy_display(HTML(JupyterRenderer().render(self)))
+        except ImportError:
+            print(self.to_mermaid())
+
+    def _repr_html_(self) -> str:
+        """
+        Protocolo de Jupyter: al evaluar `d` en una celda, renderiza el diagrama
+        automáticamente sin necesidad de llamar a display().
+        """
+        try:
+            self._validate()
+            return JupyterRenderer().render(self)
+        except ValueError as e:
+            return f"<em>{e}</em>"
 
 
 # ─────────────────────────────────────────────
@@ -174,3 +194,28 @@ class GraphvizRenderer(BaseRenderer):
             lines.append(f'    {child.id} [label="{child.text}"];')
             lines.append(f"    {node.id} -> {child.id};")
             self._walk(child, lines)
+
+
+class JupyterRenderer(BaseRenderer):
+    """
+    Genera HTML con Mermaid.js embebido para renderizado en Jupyter.
+
+    Usa ES modules (mermaid@11 via CDN) para compatibilidad con
+    JupyterLab, Jupyter Notebook y VS Code Notebooks.
+    Requiere conexión a internet la primera vez (carga CDN).
+    """
+
+    _TEMPLATE = """\
+<div style="background:white; padding:12px; border-radius:8px;">
+  <pre class="mermaid" style="text-align:left;">
+{diagram}
+  </pre>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({{ startOnLoad: true, theme: 'default' }});
+  </script>
+</div>"""
+
+    def render(self, root: Ishikawa) -> str:
+        diagram = MermaidRenderer().render(root)
+        return self._TEMPLATE.format(diagram=diagram)

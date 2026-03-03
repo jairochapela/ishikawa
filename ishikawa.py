@@ -121,6 +121,11 @@ class Ishikawa(Node):
         renderer = GraphvizRenderer()
         return renderer.render(self)
 
+    def to_ascii(self) -> str:
+        """Devuelve el diagrama como arte ASCII (espina de pescado en texto)."""
+        self._validate()
+        return ASCIIFishboneRenderer().render(self)
+
     def display(self) -> None:
         """
         Renderiza el diagrama visualmente.
@@ -201,159 +206,326 @@ class SVGFishboneRenderer(BaseRenderer):
     """
     Genera SVG nativo con apariencia real de espina de pescado.
 
-    Anatomía del diagrama:
-      - Eje horizontal (espina dorsal) con flecha → Problema (derecha)
-      - Ramas diagonales (recursos) a 45°, alternando arriba/abajo
-      - Causas como líneas horizontales desde cada rama diagonal
-      - Subcausas como pequeñas líneas verticales desde cada causa
-    Sin dependencias externas ni conexión a internet.
+    Reglas de trazado:
+    - Nivel 1 (recurso):  rama diagonal a 45°, alternando arriba/abajo.
+    - Nivel 2 (causa):    rama horizontal desde la diagonal del recurso.
+    - Nivel 3 (subcausa): diagonal a 45° de nuevo.
+    - Sucesivos niveles alternan diagonal ↔ horizontal (hasta nivel 5).
+    - Línea más fina y tipografía más pequeña a mayor profundidad.
+    - Canvas calculado dinámicamente según el árbol completo.
     """
-    # ── Constantes de layout ────────────────────────────────────────────────
-    _H       = 500    # alto total del canvas
-    _Y       = 250    # y del eje horizontal (espina dorsal)
-    _X0      = 40     # inicio del eje
-    _FIRST   = 300    # x del primer recurso sobre el eje
-    _GAP     = 240    # distancia horizontal entre recursos
-    _BLEN    = 140    # longitud de la rama diagonal
-    _BDEG    = 45     # ángulo de la rama (grados desde horizontal)
-    _CLEN    = 80     # longitud de la línea de causa (horizontal)
-    _SLEN    = 42     # longitud de la línea de subcausa (vertical)
+
+    _B     = 42                      # px por hoja (unidad de escala)
+    _INTER = 52                      # separación mínima horizontal entre recursos
+    _PAD   = 58                      # margen exterior del canvas
+    _C45   = math.cos(math.pi / 4)
+    _S45   = math.sin(math.pi / 4)
+
+    # índice = nivel − 1  (niveles 1..5)
+    _STROKES = [2.8,     2.0,     1.4,     1.0,     0.8]
+    _FONTS   = [13,      11,      9,       8,       7  ]
+    _BOLD    = ['bold', 'normal', 'normal', 'normal', 'normal']
+    _COLORS  = ['#1a5276', '#2c3e50', '#555', '#777', '#999']
+
+    # ── helpers ───────────────────────────────────────────────────────────
+
+    @classmethod
+    def _lv(cls, node: Node) -> int:
+        """Número de hojas en el subárbol."""
+        return 1 if not node.children else sum(cls._lv(c) for c in node.children)
+
+    @classmethod
+    def _h_extent(cls, node: Node, level: int) -> float:
+        """
+        Extensión horizontal máxima (hacia la izquierda) del subárbol.
+
+        La proyección horizontal de una rama es n*B para ambos tipos
+        (diagonal: L*cos45 = n*B/sin45*cos45 = n*B; horizontal: L = n*B),
+        lo que simplifica el cálculo recursivo.
+        """
+        n   = cls._lv(node)
+        own = float(n * cls._B)
+        txt = len(node.text) * 5.8          # estimación del ancho del texto
+        if not node.children:
+            return own + txt
+        total, cum, best = n, 0.0, own
+        for child in node.children:
+            cn   = cls._lv(child)
+            t    = (cum + cn / 2) / total
+            best = max(best, t * own + cls._h_extent(child, level + 1))
+            cum += cn
+        return best
+
+    @classmethod
+    def _v_max(cls, node: Node, level: int) -> float:
+        """Extensión vertical máxima del subárbol desde su punto de unión."""
+        n     = cls._lv(node)
+        # Las ramas diagonales tienen proyección vertical n*B; las horizontales, 0
+        own_v = float(n * cls._B) if level % 2 == 1 else 0.0
+        fi    = min(level - 1, len(cls._FONTS) - 1)
+        if not node.children:
+            # La etiqueta en la punta de una rama diagonal necesita espacio extra
+            return own_v + (cls._FONTS[fi] + 8 if level % 2 == 1 else 0)
+        total, cum, best = n, 0.0, own_v
+        for child in node.children:
+            cn    = cls._lv(child)
+            t     = (cum + cn / 2) / total
+            att_v = t * own_v if level % 2 == 1 else 0.0
+            best  = max(best, att_v + cls._v_max(child, level + 1))
+            cum  += cn
+        return best
+
+    # ── render principal ──────────────────────────────────────────────────
 
     def render(self, root: Ishikawa) -> str:
         resources = root.children
         n = len(resources)
-        xs = [self._FIRST + i * self._GAP for i in range(n)]
+        above_res = [r for i, r in enumerate(resources) if i % 2 == 0]
+        below_res = [r for i, r in enumerate(resources) if i % 2 == 1]
 
-        spine_end = (xs[-1] if xs else self._FIRST) + 90
-        prob_cx   = spine_end + 78
-        W = int(prob_cx + 130)
+        # Posiciones x en la espina: cada recurso se sitúa a la derecha del
+        # anterior dejando espacio para su propio subárbol + separación.
+        h_extents = [self._h_extent(r, 1) for r in resources]
+        x_pos: List[float] = []
+        if n:
+            x_pos.append(h_extents[0] + self._PAD)
+            for i in range(1, n):
+                x_pos.append(x_pos[-1] + h_extents[i] + self._INTER)
+
+        PROB_W, PROB_H = 120, 54
+        X_PROB = (x_pos[-1] if n else 0) + self._INTER + PROB_W / 2
+        W      = int(X_PROB + PROB_W / 2 + self._PAD)
+
+        # Altura del canvas: máximo alcance vertical de cada lado + márgenes
+        v_above = (max(self._v_max(r, 1) for r in above_res) if above_res else 0) + self._PAD
+        v_below = (max(self._v_max(r, 1) for r in below_res) if below_res else 0) + self._PAD
+        H = int(v_above + v_below + 2 * self._PAD)
+        Y = int(v_above + self._PAD)          # y de la espina dorsal
+
+        x_spine_start = (x_pos[0] - 18) if n else self._PAD
+        x_spine_end   = X_PROB - PROB_W / 2
 
         els: List[str] = [
-            f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{self._H}" '
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
             f'style="font-family:Arial,sans-serif;background:#fdfcfa;">',
-            # ── Marcador de flecha ───────────────────────────────────────────
-            '  <defs>',
-            '    <marker id="arr" markerWidth="10" markerHeight="7"'
-            '            refX="9" refY="3.5" orient="auto">',
-            '      <polygon points="0 0,10 3.5,0 7" fill="#555"/>',
-            '    </marker>',
-            '  </defs>',
-            # ── Eje horizontal (espina dorsal) ───────────────────────────────
-            f'  <line x1="{self._X0}" y1="{self._Y}" x2="{spine_end}" y2="{self._Y}"'
-            f' stroke="#555" stroke-width="3" marker-end="url(#arr)"/>',
+            '  <defs>'
+            '<marker id="arr" markerWidth="10" markerHeight="7" '
+            'refX="9" refY="3.5" orient="auto">'
+            '<polygon points="0 0,10 3.5,0 7" fill="#555"/>'
+            '</marker>'
+            '</defs>',
+            f'  <line x1="{x_spine_start:.1f}" y1="{Y}" '
+            f'x2="{x_spine_end:.1f}" y2="{Y}" '
+            f'stroke="#555" stroke-width="3" marker-end="url(#arr)"/>',
         ]
 
-        self._add_problem(els, root.text, prob_cx, self._Y)
-
+        self._prob_box(els, root.text, X_PROB, float(Y), PROB_W, PROB_H)
         for i, resource in enumerate(resources):
-            self._add_resource(els, resource, xs[i], self._Y, above=(i % 2 == 0))
+            sign = -1 if i % 2 == 0 else 1
+            self._draw(els, resource, x_pos[i], float(Y), 1, sign)
 
         els.append('</svg>')
         return '\n'.join(els)
 
-    # ── Caja del problema ────────────────────────────────────────────────────
+    # ── dibujo recursivo ──────────────────────────────────────────────────
 
-    def _add_problem(self, els: List[str], text: str, cx: float, cy: float) -> None:
-        bw, bh = 110, 52
-        rx, ry = cx - bw / 2, cy - bh / 2
+    def _draw(self, els: List[str], node: Node,
+              ax: float, ay: float, level: int, sign: int) -> None:
+        fi = min(level - 1, len(self._STROKES) - 1)
+        n  = self._lv(node)
+
+        if level % 2 == 1:          # ── rama diagonal ──────────────────
+            L  = n * self._B / self._S45
+            ex = ax - self._C45 * L
+            ey = ay + sign * self._S45 * L
+        else:                        # ── rama horizontal ────────────────
+            L  = float(n * self._B)
+            ex = ax - L
+            ey = ay
+
         els.append(
-            f'  <rect x="{rx:.1f}" y="{ry:.1f}" width="{bw}" height="{bh}"'
-            f' rx="8" fill="#fde8d8" stroke="#c0392b" stroke-width="2"/>'
+            f'  <line x1="{ax:.1f}" y1="{ay:.1f}" x2="{ex:.1f}" y2="{ey:.1f}"'
+            f' stroke="{self._COLORS[fi]}" stroke-width="{self._STROKES[fi]}"/>'
+        )
+        self._label(els, node.text, ex, ey, level, sign, fi)
+
+        if node.children:
+            total, cum = n, 0.0
+            for child in node.children:
+                cn = self._lv(child)
+                t  = (cum + cn / 2) / total
+                self._draw(els, child,
+                           ax + t * (ex - ax),
+                           ay + t * (ey - ay),
+                           level + 1, sign)
+                cum += cn
+
+    def _label(self, els: List[str], text: str,
+               x: float, y: float, level: int, sign: int, fi: int) -> None:
+        fs, fw, color = self._FONTS[fi], self._BOLD[fi], self._COLORS[fi]
+        tw = len(text) * fs * 0.57      # ancho estimado del texto
+
+        if level % 2 == 1:              # punta de rama diagonal
+            lx, ly, anchor = x, y + sign * (fs + 6), 'middle'
+            rx = lx - tw / 2
+        else:                           # extremo izquierdo de rama horizontal
+            lx, ly, anchor = x - 4, y - 4, 'end'
+            rx = lx - tw
+
+        els.append(
+            f'  <rect x="{rx:.1f}" y="{ly - fs:.1f}" width="{tw:.0f}" '
+            f'height="{fs + 4}" fill="white" fill-opacity="0.8" rx="2"/>'
+        )
+        els.append(
+            f'  <text x="{lx:.1f}" y="{ly:.1f}" text-anchor="{anchor}" '
+            f'font-size="{fs}" font-weight="{fw}" fill="{color}">{text}</text>'
+        )
+
+    def _prob_box(self, els: List[str], text: str,
+                  cx: float, cy: float, bw: float, bh: float) -> None:
+        els.append(
+            f'  <rect x="{cx - bw/2:.1f}" y="{cy - bh/2:.1f}" '
+            f'width="{bw}" height="{bh}" rx="8" '
+            f'fill="#fde8d8" stroke="#c0392b" stroke-width="2"/>'
         )
         words = text.split()
-        # Partir en dos líneas si el texto es largo
-        if len(text) <= 15 or len(words) <= 2:
+        if len(text) <= 16 or len(words) <= 2:
             els.append(
-                f'  <text x="{cx:.1f}" y="{cy + 5:.1f}" text-anchor="middle"'
-                f' font-size="12" font-weight="bold" fill="#c0392b">{text}</text>'
+                f'  <text x="{cx:.1f}" y="{cy + 5:.1f}" text-anchor="middle" '
+                f'font-size="12" font-weight="bold" fill="#c0392b">{text}</text>'
             )
         else:
             mid = len(words) // 2
-            l1, l2 = ' '.join(words[:mid]), ' '.join(words[mid:])
-            els.append(
-                f'  <text x="{cx:.1f}" y="{cy - 5:.1f}" text-anchor="middle"'
-                f' font-size="11" font-weight="bold" fill="#c0392b">{l1}</text>'
-            )
-            els.append(
-                f'  <text x="{cx:.1f}" y="{cy + 9:.1f}" text-anchor="middle"'
-                f' font-size="11" font-weight="bold" fill="#c0392b">{l2}</text>'
-            )
-
-    # ── Rama de recurso + causas + subcausas ─────────────────────────────────
-
-    def _add_resource(
-        self, els: List[str], resource: Node,
-        x: float, y_spine: float, above: bool
-    ) -> None:
-        ang  = math.radians(self._BDEG)
-        dx   = self._BLEN * math.cos(ang)
-        dy   = self._BLEN * math.sin(ang)
-        sign = -1 if above else 1   # -1 = arriba en SVG (y decrece)
-
-        tip_x = x - dx
-        tip_y = y_spine + sign * dy
-
-        # ── Rama diagonal ────────────────────────────────────────────────────
-        els.append(
-            f'  <line x1="{x:.1f}" y1="{y_spine}" x2="{tip_x:.1f}" y2="{tip_y:.1f}"'
-            f' stroke="#444" stroke-width="2.5"/>'
-        )
-
-        # ── Causas + subcausas ────────────────────────────────────────────────
-        n_causes = len(resource.children)
-        for i, cause in enumerate(resource.children):
-            t  = (i + 1) / (n_causes + 1)
-            px = x + t * (tip_x - x)
-            py = y_spine + t * (tip_y - y_spine)
-
-            # Línea de causa (horizontal, hacia la izquierda)
-            cx_end = px - self._CLEN
-            els.append(
-                f'  <line x1="{px:.1f}" y1="{py:.1f}" x2="{cx_end:.1f}" y2="{py:.1f}"'
-                f' stroke="#666" stroke-width="1.5"/>'
-            )
-            els.append(
-                f'  <text x="{cx_end - 5:.1f}" y="{py + 4:.1f}"'
-                f' text-anchor="end" font-size="11" fill="#2c3e50">{cause.text}</text>'
-            )
-
-            # Líneas de subcausa (verticales, hacia afuera del eje)
-            n_sub = len(cause.children)
-            for j, sub in enumerate(cause.children):
-                s    = (j + 1) / (n_sub + 1)
-                sx   = px + s * (cx_end - px)    # punto sobre la línea de causa
-                sy1  = py + sign * self._SLEN     # extremo externo
+            for k, line in enumerate([' '.join(words[:mid]), ' '.join(words[mid:])]):
                 els.append(
-                    f'  <line x1="{sx:.1f}" y1="{py:.1f}" x2="{sx:.1f}" y2="{sy1:.1f}"'
-                    f' stroke="#aaa" stroke-width="1.2"/>'
+                    f'  <text x="{cx:.1f}" y="{cy - 4 + k * 14:.1f}" '
+                    f'text-anchor="middle" font-size="11" font-weight="bold" '
+                    f'fill="#c0392b">{line}</text>'
                 )
-                # Etiqueta al final de la línea (text-anchor="middle" → no desborda lateralmente)
-                ly = sy1 + sign * 3
-                lya = ly - 4 if above else ly + 12
-                els.append(
-                    f'  <text x="{sx:.1f}" y="{lya:.1f}"'
-                    f' text-anchor="middle" font-size="9" fill="#7f8c8d">{sub.text}</text>'
-                )
-
-        # ── Etiqueta del recurso (renderizada al final → encima de todo) ─────
-        lbl_y  = tip_y + sign * 22
-        bg_w   = max(60, len(resource.text) * 7.5)
-        els.append(
-            f'  <rect x="{tip_x - bg_w/2:.1f}" y="{lbl_y - 15:.1f}"'
-            f' width="{bg_w:.0f}" height="20" fill="white" fill-opacity="0.85" rx="2"/>'
-        )
-        els.append(
-            f'  <text x="{tip_x:.1f}" y="{lbl_y:.1f}" text-anchor="middle"'
-            f' font-size="13" font-weight="bold" fill="#1a5276">{resource.text}</text>'
-        )
 
 
 class JupyterRenderer(BaseRenderer):
-    """
-    Envuelve el SVG de espina de pescado en HTML para Jupyter.
-    Sin dependencias externas ni CDN — funciona offline.
-    """
+    """Envuelve el SVG en HTML para Jupyter. Sin CDN — funciona offline."""
 
     def render(self, root: Ishikawa) -> str:
         svg = SVGFishboneRenderer().render(root)
         return f'<div style="overflow-x:auto; padding:4px;">{svg}</div>'
+
+
+class ASCIIFishboneRenderer(BaseRenderer):
+    """
+    Renderiza la espina de pescado en arte ASCII de terminal.
+
+    Estructura:
+    - Espina horizontal con '►' apuntando al problema (derecha).
+    - Recursos como diagonales '╲' (arriba) o '╱' (abajo).
+    - Causas alineadas a la derecha junto a la diagonal, con ' ─' de conexión.
+    - Subcausas indentadas bajo su causa padre para mostrar jerarquía.
+    - Espacio horizontal calculado dinámicamente por el contenido de cada recurso.
+    """
+
+    _MARGIN = 4
+
+    def render(self, root: Ishikawa) -> str:
+        resources = root.children
+        n = len(resources)
+
+        def flat(node: Node):
+            """Recorrido DFS: (profundidad, texto) para todos los descendientes."""
+            for child in node.children:
+                yield (0, child.text)
+                for d, t in flat(child):
+                    yield (d + 1, t)
+
+        def diag_len(r: Node) -> int:
+            """Filas de diagonal necesarias: una por entrada más 2 de margen."""
+            return max(len(list(flat(r))) + 2, 4)
+
+        def content_width(r: Node) -> int:
+            """Ancho máximo de los textos de causas para este recurso."""
+            entries = list(flat(r))
+            if not entries:
+                return len(r.text) + 4
+            return max(len('  ' * d + t) + 3 for d, t in entries)
+
+        above_res = [r for i, r in enumerate(resources) if i % 2 == 0]
+        below_res = [r for i, r in enumerate(resources) if i % 2 == 1]
+
+        rows_above = max((diag_len(r) + 2 for r in above_res), default=3)
+        rows_below = max((diag_len(r) + 2 for r in below_res), default=3)
+        spine_row  = rows_above
+        total_rows = spine_row + 1 + rows_below
+
+        # x de cada recurso en la espina, calculado dinámicamente.
+        # El subárbol de cada recurso se extiende hacia la izquierda, ocupando
+        # content_width + diag_len columnas. Los recursos de lados opuestos no
+        # se solapan verticalmente, por lo que podemos usar la mitad como paso.
+        x_pos: List[int] = []
+        if n:
+            x_pos.append(self._MARGIN + content_width(resources[0]) + diag_len(resources[0]))
+            for i in range(1, n):
+                step = max(content_width(resources[i]) // 2 + diag_len(resources[i]) // 2 + 4, 16)
+                x_pos.append(x_pos[-1] + step)
+
+        prob_text = root.text
+        spine_end = (x_pos[-1] + 6) if n else self._MARGIN + 20
+        W = spine_end + len(prob_text) + 5
+
+        canvas: List[List[str]] = [[' '] * W for _ in range(total_rows)]
+
+        # Espina dorsal
+        for x in range(self._MARGIN, spine_end):
+            canvas[spine_row][x] = '─'
+        canvas[spine_row][spine_end] = '►'
+        for j, ch in enumerate(f' {prob_text}'):
+            if spine_end + j < W:
+                canvas[spine_row][spine_end + j] = ch
+
+        for i, resource in enumerate(resources):
+            above   = (i % 2 == 0)
+            sign    = -1 if above else 1
+            x       = x_pos[i]
+            dlen    = diag_len(resource)
+            entries = list(flat(resource))
+            n_ent   = len(entries)
+
+            # Diagonal
+            for k in range(1, dlen + 1):
+                row = spine_row + sign * k
+                col = x - k
+                if 0 <= row < total_rows and 0 <= col < W:
+                    canvas[row][col] = '╲' if above else '╱'
+
+            # Etiqueta del recurso en la punta de la diagonal
+            label   = f'[{resource.text}]'
+            tip_row = max(0, min(spine_row + sign * (dlen + 1), total_rows - 1))
+            tip_col = x - dlen - 1 - len(label) // 2
+            for j, ch in enumerate(label):
+                c = tip_col + j
+                if 0 <= c < W:
+                    canvas[tip_row][c] = ch
+
+            # Causas y subcausas distribuidas a lo largo de la diagonal
+            if n_ent:
+                # Asignar posiciones k únicas, bien distribuidas
+                k_vals: List[int] = []
+                for idx in range(n_ent):
+                    k = max(1, min(dlen - 1,
+                                  round((idx + 0.5) / n_ent * (dlen - 1)) + 1))
+                    if k_vals and k <= k_vals[-1]:
+                        k = k_vals[-1] + 1
+                    k_vals.append(min(k, dlen - 1))
+
+                for idx, (depth, text) in enumerate(entries):
+                    k   = k_vals[idx]
+                    row = spine_row + sign * k
+                    col = x - k                      # columna de la diagonal
+                    entry = '  ' * depth + text + ' ─'
+                    # Alineado a la derecha: el ' ─' final apunta a la diagonal
+                    start = col - len(entry)
+                    for j, ch in enumerate(entry):
+                        c = start + j
+                        if 0 <= c < W and 0 <= row < total_rows:
+                            canvas[row][c] = ch
+
+        return '\n'.join(''.join(row).rstrip() for row in canvas)
